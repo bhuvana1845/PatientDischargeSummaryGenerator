@@ -1,646 +1,370 @@
-import os
-import io
-import re
-import tempfile
-from pathlib import Path
-
 import streamlit as st
-from pypdf import PdfReader
-from sentence_transformers import SentenceTransformer
-import numpy as np
-import faiss
+import os
+import tempfile
 
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_CENTER
-from reportlab.platypus import (
-    SimpleDocTemplate,
-    Paragraph,
-    Spacer,
-    PageBreak
+from preprocess import (
+    extract_text_from_pdf,
+    extract_text_from_ehr,
+    extract_patient_information,
+    create_patient_context
 )
 
-from huggingface_hub import InferenceClient
+from rag import MedicalRAG
+from llm import generate_patient_summary
+from validator import validate_summary
+from pdf_generator import create_discharge_pdf
 
-
-# ============================================================
-# PAGE CONFIGURATION
-# ============================================================
 
 st.set_page_config(
     page_title="Patient-Friendly Discharge Summary Generator",
-    page_icon="🏥",
-    layout="wide"
+    page_icon="🏥"
+)
+
+st.title("Patient-Friendly Discharge Summary Generator")
+
+st.write(
+    "Generate a simple and understandable discharge summary "
+    "from an Electronic Health Record (EHR)."
+)
+
+st.warning(
+    "This is an academic prototype. The generated summary "
+    "should be reviewed by a qualified healthcare professional."
 )
 
 
-# ============================================================
-# TITLE
-# ============================================================
+st.subheader("Enter Patient Information")
 
-st.title("🏥 Patient-Friendly Discharge Summary Generator")
-
-st.markdown(
-    """
-    This application converts complex hospital discharge information
-    into simple, patient-friendly language using **Retrieval-Augmented
-    Generation (RAG)** and a **Large Language Model (LLM)**.
-    """
+input_method = st.radio(
+    "Select input method",
+    ["Upload EHR PDF", "Enter EHR Note"]
 )
 
-st.divider()
+
+ehr_text = ""
 
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+if input_method == "Upload EHR PDF":
 
-KNOWLEDGE_DIR = Path("med_knowledge")
-
-# Hugging Face model
-MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
-
-# Embedding model
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-
-
-# ============================================================
-# LOAD MODELS
-# ============================================================
-
-@st.cache_resource
-def load_embedding_model():
-    return SentenceTransformer(EMBEDDING_MODEL)
-
-
-@st.cache_resource
-def load_llm():
-    token = os.getenv("HF_TOKEN")
-
-    if not token:
-        return None
-
-    return InferenceClient(
-        provider="hf-inference",
-        api_key=token
+    uploaded_file = st.file_uploader(
+        "Upload EHR PDF",
+        type=["pdf"]
     )
 
-
-embedding_model = load_embedding_model()
-llm_client = load_llm()
-
-
-# ============================================================
-# PDF TEXT EXTRACTION
-# ============================================================
-
-def extract_text_from_pdf(pdf_file):
-
-    reader = PdfReader(pdf_file)
-
-    text = ""
-
-    for page in reader.pages:
-        page_text = page.extract_text()
-
-        if page_text:
-            text += page_text + "\n"
-
-    return text.strip()
-
-
-# ============================================================
-# TEXT CLEANING
-# ============================================================
-
-def preprocess_text(text):
-
-    text = re.sub(r"\s+", " ", text)
-
-    text = re.sub(
-        r"Page\s+\d+",
-        "",
-        text,
-        flags=re.IGNORECASE
-    )
-
-    return text.strip()
-
-
-# ============================================================
-# TEXT CHUNKING
-# ============================================================
-
-def create_chunks(text, chunk_size=500, overlap=100):
-
-    words = text.split()
-
-    chunks = []
-
-    start = 0
-
-    while start < len(words):
-
-        end = start + chunk_size
-
-        chunk = " ".join(words[start:end])
-
-        if chunk.strip():
-            chunks.append(chunk)
-
-        start = end - overlap
-
-    return chunks
-
-
-# ============================================================
-# LOAD MEDICAL KNOWLEDGE
-# ============================================================
-
-@st.cache_data
-def load_medical_knowledge():
-
-    documents = []
-
-    if not KNOWLEDGE_DIR.exists():
-        return documents
-
-    pdf_files = list(KNOWLEDGE_DIR.glob("*.pdf"))
-
-    for pdf_path in pdf_files:
+    if uploaded_file is not None:
 
         try:
+            with tempfile.NamedTemporaryFile(
+                delete=False,
+                suffix=".pdf"
+            ) as temp_file:
 
-            reader = PdfReader(str(pdf_path))
+                temp_file.write(uploaded_file.getbuffer())
+                temp_pdf_path = temp_file.name
 
-            text = ""
+            ehr_text = extract_text_from_pdf(temp_pdf_path)
 
-            for page in reader.pages:
+            os.remove(temp_pdf_path)
 
-                page_text = page.extract_text()
+            if ehr_text.strip():
+                st.success("EHR information extracted successfully.")
 
-                if page_text:
-                    text += page_text + "\n"
+                with st.expander("View EHR Information"):
+                    st.text(ehr_text)
 
-            if text.strip():
-
-                chunks = create_chunks(
-                    preprocess_text(text)
-                )
-
-                for chunk in chunks:
-
-                    documents.append({
-                        "text": chunk,
-                        "source": pdf_path.name
-                    })
+            else:
+                st.error("No readable text was found in the PDF.")
 
         except Exception as e:
+            st.error(f"Error reading PDF: {e}")
 
-            st.warning(
-                f"Could not read {pdf_path.name}: {e}"
-            )
+else:
 
-    return documents
+    ehr_text = st.text_area(
+        "EHR Note",
+        height=350,
+        placeholder="""Patient Name: John Doe
+Age: 55
+Gender: Male
 
+Diagnosis:
+Type 2 Diabetes Mellitus and Hypertension.
 
-# ============================================================
-# CREATE VECTOR INDEX
-# ============================================================
+Medications:
+Metformin 500 mg twice daily.
+Amlodipine 5 mg once daily.
 
-@st.cache_resource
-def create_vector_index():
+Laboratory Results:
+HbA1c: 7.2%
+Blood Pressure: 138/86 mmHg.
 
-    documents = load_medical_knowledge()
+Physician Recommendations:
+Continue medications and maintain a healthy diet.
 
-    if not documents:
-        return None, []
+Follow-up:
+Follow up with physician after 2 weeks.
 
-    texts = [
-        document["text"]
-        for document in documents
-    ]
-
-    embeddings = embedding_model.encode(
-        texts,
-        convert_to_numpy=True,
-        normalize_embeddings=True
+Allergies:
+No known drug allergies."""
     )
 
-    dimension = embeddings.shape[1]
 
-    index = faiss.IndexFlatIP(dimension)
+if st.button("Generate Discharge Summary"):
 
-    index.add(
-        embeddings.astype("float32")
-    )
+    if not ehr_text.strip():
 
-    return index, documents
+        st.error("Please upload an EHR PDF or enter an EHR note.")
 
+    else:
 
-# ============================================================
-# RAG RETRIEVAL
-# ============================================================
+        with st.spinner("Processing EHR information..."):
 
-def retrieve_context(query, top_k=5):
+            try:
+                cleaned_ehr = extract_text_from_ehr(ehr_text)
 
-    index, documents = create_vector_index()
-
-    if index is None:
-        return []
-
-    query_embedding = embedding_model.encode(
-        [query],
-        convert_to_numpy=True,
-        normalize_embeddings=True
-    )
-
-    scores, indices = index.search(
-        query_embedding.astype("float32"),
-        top_k
-    )
-
-    retrieved = []
-
-    for score, index_id in zip(
-        scores[0],
-        indices[0]
-    ):
-
-        if index_id == -1:
-            continue
-
-        retrieved.append({
-            "text": documents[index_id]["text"],
-            "source": documents[index_id]["source"],
-            "score": float(score)
-        })
-
-    return retrieved
-
-
-# ============================================================
-# GENERATE SUMMARY USING LLM
-# ============================================================
-
-def generate_summary(patient_text, retrieved_context):
-
-    if llm_client is None:
-
-        return None
-
-    context_text = "\n\n".join(
-        [
-            f"Source: {item['source']}\n"
-            f"{item['text']}"
-            for item in retrieved_context
-        ]
-    )
-
-    prompt = f"""
-You are a healthcare communication assistant.
-
-Your task is to convert the provided hospital discharge
-information into a simple, patient-friendly discharge summary.
-
-IMPORTANT:
-- Do not invent medical information.
-- Do not change medication doses.
-- Do not create diagnoses that are not present.
-- Use the retrieved medical knowledge only as supporting context.
-- Preserve important clinical information.
-- Use simple language that a patient or caregiver can understand.
-- If information is unavailable, write "Not provided in the discharge information."
-
-Create the following six sections:
-
-1. Patient Diagnosis Overview
-2. Medication Changes and Dosage Instructions
-3. Follow-up Appointment Recommendations
-4. Lifestyle and Recovery Guidelines
-5. Important Warning Signs Requiring Medical Attention
-6. Contact Information and Emergency Instructions
-
-PATIENT DISCHARGE INFORMATION:
-{patient_text}
-
-RETRIEVED MEDICAL KNOWLEDGE:
-{context_text}
-
-Return a clear and structured patient-friendly discharge summary.
-"""
-
-    try:
-
-        response = llm_client.chat.completions.create(
-
-            model=MODEL_NAME,
-
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a medical communication "
-                        "assistant. Simplify information "
-                        "without inventing facts."
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-
-            max_tokens=1800,
-
-            temperature=0.2
-        )
-
-        return response.choices[0].message.content
-
-    except Exception as e:
-
-        st.error(
-            f"LLM generation failed: {e}"
-        )
-
-        return None
-
-
-# ============================================================
-# PDF GENERATION
-# ============================================================
-
-def create_pdf(summary):
-
-    buffer = io.BytesIO()
-
-    document = SimpleDocTemplate(
-        buffer,
-        pagesize=A4,
-        rightMargin=40,
-        leftMargin=40,
-        topMargin=40,
-        bottomMargin=40
-    )
-
-    styles = getSampleStyleSheet()
-
-    title_style = ParagraphStyle(
-        "TitleStyle",
-        parent=styles["Title"],
-        alignment=TA_CENTER,
-        fontSize=20,
-        spaceAfter=20
-    )
-
-    heading_style = ParagraphStyle(
-        "HeadingStyle",
-        parent=styles["Heading2"],
-        fontSize=14,
-        spaceBefore=12,
-        spaceAfter=8
-    )
-
-    body_style = ParagraphStyle(
-        "BodyStyle",
-        parent=styles["BodyText"],
-        fontSize=10.5,
-        leading=15,
-        spaceAfter=8
-    )
-
-    story = []
-
-    story.append(
-        Paragraph(
-            "Patient-Friendly Discharge Summary",
-            title_style
-        )
-    )
-
-    sections = re.split(
-        r"\n(?=\d+\.)",
-        summary
-    )
-
-    for section in sections:
-
-        lines = section.strip().split("\n")
-
-        if not lines:
-            continue
-
-        heading = lines[0]
-
-        content = " ".join(
-            lines[1:]
-        ).strip()
-
-        if not content:
-
-            content = heading
-
-            story.append(
-                Paragraph(
-                    content,
-                    heading_style
-                )
-            )
-
-        else:
-
-            story.append(
-                Paragraph(
-                    heading,
-                    heading_style
-                )
-            )
-
-            content = content.replace(
-                "&",
-                "&amp;"
-            )
-
-            story.append(
-                Paragraph(
-                    content,
-                    body_style
-                )
-            )
-
-    document.build(story)
-
-    buffer.seek(0)
-
-    return buffer
-
-
-# ============================================================
-# USER INTERFACE
-# ============================================================
-
-st.subheader("📄 Upload Discharge Summary")
-
-uploaded_file = st.file_uploader(
-    "Upload the patient's discharge summary PDF",
-    type=["pdf"]
-)
-
-
-if uploaded_file is not None:
-
-    st.success(
-        f"Uploaded: {uploaded_file.name}"
-    )
-
-    if st.button(
-        "✨ Generate Patient-Friendly Summary",
-        type="primary"
-    ):
-
-        with st.spinner(
-            "Extracting information from the discharge summary..."
-        ):
-
-            patient_text = extract_text_from_pdf(
-                uploaded_file
-            )
-
-            patient_text = preprocess_text(
-                patient_text
-            )
-
-        if not patient_text:
-
-            st.error(
-                "Could not extract text from the uploaded PDF."
-            )
-
-            st.stop()
-
-        st.subheader(
-            "🔍 Extracted Patient Information"
-        )
-
-        with st.expander(
-            "View extracted information"
-        ):
-
-            st.write(patient_text)
-
-        # ----------------------------------------------------
-        # RETRIEVAL
-        # ----------------------------------------------------
-
-        with st.spinner(
-            "Retrieving relevant medical knowledge..."
-        ):
-
-            retrieved_context = retrieve_context(
-                patient_text,
-                top_k=5
-            )
-
-        st.subheader(
-            "📚 Retrieved Medical Context"
-        )
-
-        if retrieved_context:
-
-            for item in retrieved_context:
-
-                st.caption(
-                    f"Source: {item['source']} "
-                    f"| Similarity: {item['score']:.2f}"
+                patient_info = extract_patient_information(
+                    cleaned_ehr
                 )
 
-                st.write(
-                    item["text"]
+                patient_context = create_patient_context(
+                    patient_info
                 )
 
-        else:
+            except Exception as e:
 
-            st.warning(
-                "No medical knowledge documents were found."
+                st.error(
+                    f"Error during EHR preprocessing: {e}"
+                )
+
+                st.stop()
+
+
+        st.subheader("Extracted Patient Information")
+
+        st.write(
+            "**Patient Name:**",
+            patient_info.get("patient_name", "Not provided")
+        )
+
+        st.write(
+            "**Age:**",
+            patient_info.get("age", "Not provided")
+        )
+
+        st.write(
+            "**Gender:**",
+            patient_info.get("gender", "Not provided")
+        )
+
+        st.write(
+            "**Diagnosis:**",
+            patient_info.get("diagnosis", "Not provided")
+        )
+
+        st.write(
+            "**Medications:**",
+            patient_info.get("medications", "Not provided")
+        )
+
+        st.write(
+            "**Laboratory Results:**",
+            patient_info.get(
+                "laboratory_results",
+                "Not provided"
+            )
+        )
+
+        st.write(
+            "**Physician Recommendations:**",
+            patient_info.get(
+                "physician_recommendations",
+                "Not provided"
+            )
+        )
+
+        st.write(
+            "**Follow-up:**",
+            patient_info.get(
+                "follow_up",
+                "Not provided"
+            )
+        )
+
+        st.write(
+            "**Allergies:**",
+            patient_info.get(
+                "allergies",
+                "Not provided"
+            )
+        )
+
+
+        with st.spinner("Retrieving relevant medical information..."):
+
+            try:
+
+                rag = MedicalRAG()
+
+                query = (
+                    patient_info.get("diagnosis", "")
+                    + " "
+                    + patient_info.get("medications", "")
+                    + " "
+                    + patient_info.get("laboratory_results", "")
+                )
+
+                retrieved_documents = rag.retrieve_documents(
+                    query,
+                    top_k=3
+                )
+
+            except Exception as e:
+
+                st.error(
+                    f"Error during knowledge retrieval: {e}"
+                )
+
+                st.stop()
+
+
+        medical_context = ""
+
+        for document in retrieved_documents:
+
+            medical_context += (
+                "\nSource: "
+                + document["filename"]
+                + "\n"
+                + document["text"]
+                + "\n"
             )
 
-        # ----------------------------------------------------
-        # GENERATION
-        # ----------------------------------------------------
 
         with st.spinner(
             "Generating patient-friendly discharge summary..."
         ):
 
-            summary = generate_summary(
-                patient_text,
-                retrieved_context
+            summary = generate_patient_summary(
+                patient_context,
+                medical_context
             )
 
-        if summary:
 
-            st.success(
-                "Patient-friendly summary generated successfully!"
+        if summary.startswith("ERROR:"):
+
+            st.error(summary)
+
+            st.stop()
+
+
+        st.subheader("Patient-Friendly Discharge Summary")
+
+        st.markdown(summary)
+
+
+        st.subheader("Validation")
+
+        try:
+
+            validation_result = validate_summary(
+                summary,
+                patient_info
             )
 
-            st.subheader(
-                "📝 Patient-Friendly Discharge Summary"
+            if isinstance(validation_result, dict):
+
+                score = validation_result.get(
+                    "score",
+                    0
+                )
+
+                valid = validation_result.get(
+                    "valid",
+                    False
+                )
+
+                missing_sections = validation_result.get(
+                    "missing_sections",
+                    []
+                )
+
+                missing_information = validation_result.get(
+                    "missing_information",
+                    []
+                )
+
+                message = validation_result.get(
+                    "message",
+                    ""
+                )
+
+                st.write(
+                    f"Validation Score: {score}%"
+                )
+
+                if valid:
+                    st.success(
+                        "The generated summary passed basic validation."
+                    )
+                else:
+                    st.warning(
+                        "The generated summary requires review."
+                    )
+
+                if message:
+                    st.write(message)
+
+                if missing_sections:
+
+                    st.write(
+                        "Missing Sections:",
+                        ", ".join(missing_sections)
+                    )
+
+                if missing_information:
+
+                    st.write(
+                        "Missing Information:",
+                        ", ".join(missing_information)
+                    )
+
+        except Exception as e:
+
+            st.warning(
+                f"Validation could not be completed: {e}"
             )
 
-            st.markdown(summary)
 
-            # ------------------------------------------------
-            # PDF
-            # ------------------------------------------------
+        st.subheader("Download")
 
-            pdf_file = create_pdf(
-                summary
+        try:
+
+            os.makedirs(
+                "output",
+                exist_ok=True
             )
 
-            st.download_button(
-                label="📥 Download Summary as PDF",
-                data=pdf_file,
-                file_name="patient_friendly_discharge_summary.pdf",
-                mime="application/pdf"
+            pdf_path = create_discharge_pdf(
+                summary,
+                output_path="output/discharge_summary.pdf"
             )
 
-        else:
+            if os.path.exists(pdf_path):
+
+                with open(
+                    pdf_path,
+                    "rb"
+                ) as pdf_file:
+
+                    st.download_button(
+                        "Download Discharge Summary PDF",
+                        data=pdf_file,
+                        file_name="patient_friendly_discharge_summary.pdf",
+                        mime="application/pdf"
+                    )
+
+        except Exception as e:
 
             st.error(
-                "Summary generation could not be completed."
+                f"Error generating PDF: {e}"
             )
-
-
-# ============================================================
-# SIDEBAR
-# ============================================================
-
-with st.sidebar:
-
-    st.header("ℹ️ About the System")
-
-    st.write(
-        """
-        This system uses:
-
-        • PDF/EHR information extraction  
-        • Text preprocessing  
-        • Semantic medical knowledge retrieval  
-        • Retrieval-Augmented Generation (RAG)  
-        • Large Language Model (LLM)  
-        • Patient-friendly language generation  
-        • PDF report generation
-        """
-    )
-
-    st.warning(
-        """
-        This application is intended for
-        educational/research purposes.
-
-        Generated information should be
-        reviewed by a qualified healthcare
-        professional before clinical use.
-        """
-    )
